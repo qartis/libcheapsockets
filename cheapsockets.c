@@ -1,35 +1,24 @@
 #include <ctype.h>
 #include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
 #include <curl/curl.h>
 
 #include "cheapsockets.h"
 
-void cheapsockets_init(struct cheapsockets_t *sock){
-    sock->offset = 0;
-    sock->reconnect_list = NULL;
-    sock->netbuf[0] = '\0';
-
-    curl_global_init(CURL_GLOBAL_ALL);
-    sock->multi = curl_multi_init();
-
-    curl_multi_setopt(sock->multi, CURLMOPT_SOCKETFUNCTION, cheapsockets_socket_cb);
-    curl_multi_setopt(sock->multi, CURLMOPT_TIMERFUNCTION, cheapsockets_timeout_cb);
-    curl_multi_setopt(sock->multi, CURLMOPT_SOCKETDATA, sock);
-    curl_multi_setopt(sock->multi, CURLMOPT_TIMERDATA, sock);
+void cheapsocket_seturls(cheapsocket *sock, const char *get_url, const char *put_url){
+    sock->get_url = strdup(get_url);
+    sock->put_url = strdup(put_url);
 }
 
-void cheapsockets_seturls(struct cheapsockets_t *sock, const char *get_url, const char *put_url){
-    s->get_url = strdup(get_url);
-    s->put_url = strdup(put_url);
-}
-
-int cheapsockets_connect(struct cheapsocket_t *sock){
+int cheapsocket_connect(cheapsocket *sock){
     char buf[128];
     sprintf(buf, "%s?offset=%lu", sock->get_url, sock->offset);
-    return cheapsockets_new_conn(sock, buf, 1);
+    return cheapsocket_new_conn(sock, buf, 1);
 }
 
-int cheapsockets_send(struct cheapsocket_t *sock, void *obj, const char *fmt, ...){
+int cheapsocket_send(cheapsocket *sock, void *obj, const char *fmt, ...){
     va_list args;
     char *url;
     char *msg = NULL;
@@ -60,23 +49,23 @@ int cheapsockets_send(struct cheapsocket_t *sock, void *obj, const char *fmt, ..
         msgp++;
     }
     *endp = '\0';
-    cheapsockets_new_conn(sock, url, 0);
+    cheapsocket_new_conn(sock, url, 0);
     free(url);
     free(msg);
 }
 
-size_t cheapsockets_ignore_data(void *buf, size_t size, size_t nmemb, void *data){
+size_t cheapsocket_ignore_data(void *buf, size_t size, size_t nmemb, void *data){
     (void)buf;
     (void)data;
     /* TODO handle this data reply */
     return size * nmemb;
 }
 
-size_t net_t::parse_packet_cb(void *buf, size_t size, size_t nmemb, void *data){
+size_t cheapsocket_packet_cb(void *buf, size_t size, size_t nmemb, void *data){
     struct ConnInfo *conn = (struct ConnInfo *)data;
-    struct cheapsocket_t *sock = conn->global;
+    cheapsocket *sock = conn->global;
     unsigned tmp_offset = 0;
-    char *packetbuf = (char *)malloc(size * nmemb + strlen(net->netbuf) + 1);
+    char *packetbuf = (char *)malloc(size * nmemb + strlen(sock->netbuf) + 1);
     strcpy(packetbuf, sock->netbuf);
     strncat(packetbuf, (const char *)buf, size * nmemb);
     char *start = packetbuf;
@@ -98,16 +87,16 @@ size_t net_t::parse_packet_cb(void *buf, size_t size, size_t nmemb, void *data){
         }
         (sock->packet_handler)(start);
         start = nl + 1;
-        net->offset = tmp_offset;
+        sock->offset = tmp_offset;
     }
-    strcpy(net->netbuf, start);
+    strcpy(sock->netbuf, start);
     free(packetbuf);
 
     return size * nmemb;
 }
 
-void cheapsockets_timer_cb(void *data){
-    struct cheapsockets_t *sock = (struct cheapsockets_t *)data;
+void cheapsocket_timer_cb(void *data){
+    cheapsocket *sock = (cheapsocket *)data;
     CURLMcode rc = curl_multi_socket_action(sock->multi,
                                             CURL_SOCKET_TIMEOUT,
                                             0,
@@ -118,8 +107,8 @@ void cheapsockets_timer_cb(void *data){
     check_multi_info(sock);
 }
 
-void cheapsockets_perform_reconnects_cb(void *data){
-    struct cheapsockets_t *sock = (struct cheapsockets_t *)data;
+void cheapsocket_perform_reconnects_cb(void *data){
+    cheapsocket *sock = (cheapsocket *)data;
     struct ConnInfo *conn;
     struct ConnInfo *next;
 
@@ -130,7 +119,7 @@ void cheapsockets_perform_reconnects_cb(void *data){
             sprintf(buf, "%s?offset=%lu", sock->get_url, sock->offset);
             url = buf;
         }
-        cheapsockets_new_conn(sock, url, conn->is_poll);
+        cheapsocket_new_conn(sock, url, conn->is_poll);
         next = conn->next;
         free(conn->url);
         free(conn);
@@ -138,113 +127,115 @@ void cheapsockets_perform_reconnects_cb(void *data){
     sock->reconnect_list = NULL;
 }
 
-void net_t::cleanup_completed_transfer(CURLMsg *msg){
+void cheapsocket_cleanup_transfer(cheapsocket *sock, CURLMsg *msg){
     struct ConnInfo *conn;
     CURL *easy = msg->easy_handle;
     CURLcode res = msg->data.result;
     curl_easy_getinfo(easy, CURLINFO_PRIVATE, &conn);
-    curl_multi_remove_handle(multi, easy);
+    curl_multi_remove_handle(sock->multi, easy);
     curl_easy_cleanup(easy);
 
     if (res != CURLE_OK){
         printf("died: %s%s\n", curl_easy_strerror(res), conn->is_poll ? " (poll)" : " (upload)");
-        conn->next = reconnect_list;
-        reconnect_list = conn;
-        Fl::remove_timeout(perform_reconnects_cb);
-        Fl::add_timeout(1.0, perform_reconnects_cb, (void*)this);
+        conn->next = sock->reconnect_list;
+        sock->reconnect_list = conn;
+        sock->remove_timeout(cheapsocket_perform_reconnects_cb);
+        sock->add_timeout(1.0, cheapsocket_perform_reconnects_cb, (void*)sock);
         return;
     }
 
     if (conn->is_poll){
         printf("connection died!\n");
-        Fl::remove_timeout(timer_cb);
+        sock->remove_timeout(cheapsocket_timer_cb);
         char buf[128];
-        sprintf(buf, "%s?offset=%lu", get_url, offset);
+        sprintf(buf, "%s?offset=%lu", sock->get_url, sock->offset);
         new_conn(buf, 1);
-        timer_cb((void*)this);
+        timer_cb((void*)sock);
     }
     free(conn->url);
     free(conn);
 }
 
-void net_t::check_multi_info(){
+void cheapsocket_check_multi_info(cheapsocket *sock){
     CURLMsg *msg;
     int msgs_left;
 
-    while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+    while ((msg = curl_multi_info_read(sock->multi, &msgs_left))) {
         if (msg->msg == CURLMSG_DONE) {
-            cleanup_completed_transfer(msg);
+            cleanup_completed_transfer(sock, msg);
         }
     }
 }
 
-int net_t::update_timeout_cb(CURLM *multi, long timeout_ms, void *userp){
+int cheapsocket_timeout_cb(CURLM *multi, long timeout_ms, void *userp){
     (void)multi;
     double t = (double)timeout_ms / 1000.0;
-    net_t *net=(net_t *)userp;
+    cheapsocket *sock = (cheapsocket *)userp;
 
     if (timeout_ms > -1){
-        Fl::add_timeout(t, timer_cb, (void *)net);
+        sock->add_timeout(t, cheapsocket_timer_cb, (void *)sock);
     }
     return 0;
 }
 
-void net_t::event_cb(int fd, void *data){
-    net_t *net = (net_t*) data;
+void cheapsocket_event_cb(int fd, void *data){
+    cheapsocket *sock = (cheapsocket *)data;
     CURLMcode rc;
 
-    rc = curl_multi_socket_action(net->multi, fd, 0, &net->still_running);
-    net->mcode_or_die("event_cb: curl_multi_socket_action", rc);
+    rc = curl_multi_socket_action(sock->multi, fd, 0, &sock->still_running);
+    if (rc != CURLM_OK){
+        //TODO handle this
+    }
 
-    net->check_multi_info();
-    if(!net->still_running) {
-        Fl::remove_timeout(timer_cb);
+    cheapsocket_check_multi_info(sock);
+    if(!sock->still_running){
+        sock->remove_timeout(cheapsocket_timer_cb);
     }
 }
 
-void net_t::remsock(struct SockInfo *f){
+void simplesocket_rmsock(cheapsocket *sock, struct SockInfo *f){
     if (!f){
         return;
     }
-    Fl::remove_fd(f->fd);
+    sock->remove_fd(f->fd);
     free(f);
 }
 
-void net_t::setsock(struct SockInfo *f, curl_socket_t s, CURL*e, int act){
+void simplesocket_setsock(cheapsocket *sock, struct SockInfo *f, curl_socket_t s, CURL*e, int act){
     int when = (act&CURL_POLL_IN?FL_READ:0)|(act&CURL_POLL_OUT?FL_WRITE:0);
 
     f->sockfd = s;
     f->action = act;
     f->easy = e;
     Fl::remove_fd(f->fd);
-    Fl::add_fd(f->fd, when, event_cb, (void *)this);
+    Fl::add_fd(f->fd, when, event_cb, (void *)sock);
 }
 
-void net_t::addsock(curl_socket_t s, CURL *easy, int action) {
+void simplesocket_addsock(cheapsocket *sock, curl_socket_t s, CURL *easy, int action){
     struct SockInfo *fdp = (struct SockInfo *)malloc(sizeof(struct SockInfo));
     memset(fdp, sizeof(struct SockInfo), '\0');
 
-    fdp->global = this;
+    fdp->global = sock;
     fdp->fd = s;
-    setsock(fdp, s, easy, action);
-    curl_multi_assign(multi, s, fdp);
+    setsock(sock, fdp, s, easy, action);
+    curl_multi_assign(sock->multi, s, fdp);
 }
 
-int net_t::sock_cb(CURL *e, curl_socket_t s, int what, void *cbp, void *sockp){
-    net_t *net = (net_t*) cbp;
+int cheapsocket_socket_cb(CURL *e, curl_socket_t s, int what, void *cbp, void *sockp){
+    cheapsocket *sock = (cheapsocket *)cbp;
     struct SockInfo *fdp = (struct SockInfo*) sockp;
 
     if (what == CURL_POLL_REMOVE) {
-        net->remsock(fdp);
+        cheapsocket_rmsock(sock, fdp);
     } else if (!fdp) {
-        net->addsock(s, e, what);
+        cheapsocket_addsock(sock, s, e, what);
     } else {
-        net->setsock(fdp, s, e, what);
+        cheapsocket_setsock(sock, fdp, s, e, what);
     }
     return 0;
 }
 
-void net_t::new_conn(const char *url, bool is_poll){
+void cheapsocket_new_conn(cheapsocket *sock, const char *url, bool is_poll){
     CURLMcode rc;
 
     struct ConnInfo *conn = (struct ConnInfo *)malloc(sizeof(struct ConnInfo));
@@ -257,23 +248,39 @@ void net_t::new_conn(const char *url, bool is_poll){
         printf("curl_easy_init() failed, exiting!\n");
         exit(2);
     }
-    conn->global = this;
+    conn->global = sock;
     conn->url = strdup(url);
     curl_easy_setopt(conn->easy, CURLOPT_URL, conn->url);
     if (conn->is_poll){
-        curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, parse_packet_cb);
+        curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, cheapsocket_parse_packet_cb);
     } else {
-        curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, ignore_data);
+        curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, cheapsocket_ignore_data);
     }
     curl_easy_setopt(conn->easy, CURLOPT_WRITEDATA, conn);
     curl_easy_setopt(conn->easy, CURLOPT_PRIVATE, conn);
     curl_easy_setopt(conn->easy, CURLOPT_NOPROGRESS, 1L);
-    //curl_easy_setopt(conn->easy, CURLOPT_VERBOSE, 1L);
     curl_easy_setopt(conn->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(conn->easy, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(conn->easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(conn->easy, CURLOPT_LOW_SPEED_TIME, 30L);
 
-    rc = curl_multi_add_handle(multi, conn->easy);
-    mcode_or_die("new_conn: curl_multi_add_handle", rc);
+    rc = curl_multi_add_handle(sock->multi, conn->easy);
+    if (rc != CURLM_OK){
+        //TODO handle this
+    }
 }
+
+void cheapsocket_init(cheapsocket *sock){
+    sock->offset = 0;
+    sock->reconnect_list = NULL;
+    sock->netbuf[0] = '\0';
+
+    curl_global_init(CURL_GLOBAL_ALL);
+    sock->multi = curl_multi_init();
+
+    curl_multi_setopt(sock->multi, CURLMOPT_SOCKETFUNCTION, cheapsocket_socket_cb);
+    curl_multi_setopt(sock->multi, CURLMOPT_TIMERFUNCTION, cheapsocket_timeout_cb);
+    curl_multi_setopt(sock->multi, CURLMOPT_SOCKETDATA, sock);
+    curl_multi_setopt(sock->multi, CURLMOPT_TIMERDATA, sock);
+}
+
