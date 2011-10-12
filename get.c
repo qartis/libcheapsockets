@@ -6,7 +6,8 @@
 #include <signal.h>
 
 void gotline(long offset, const char *buf){
-    printf("%lu %.*s\n", offset, strlen(buf)-1, buf);
+    int maxlen = strlen(buf) - 1;
+    printf("%lu %.*s\n", offset, maxlen, buf);
 }
 
 int main(int argc, char **argv){
